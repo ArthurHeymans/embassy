@@ -527,6 +527,8 @@ impl<'d, T: Instance, M: PeriMode> Ospi<'d, T, M> {
         // Need additional validation that command configuration doesn't have data set
         self.configure_command(command, None)?;
 
+        T::REGS.cr().modify(|v| v.set_fmode(vals::FunctionalMode::INDIRECT_WRITE));
+
         // Transaction initiated by setting final configuration, i.e the instruction register
         while !T::REGS.sr().read().tcf() {}
         T::REGS.fcr().write(|w| {
