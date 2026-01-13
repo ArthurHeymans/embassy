@@ -48,9 +48,157 @@ static BUS_WAKER: AtomicWaker = AtomicWaker::new();
 static EP_IN_WAKERS: [AtomicWaker; EP_COUNT] = [const { AtomicWaker::new() }; EP_COUNT];
 static EP_OUT_WAKERS: [AtomicWaker; EP_COUNT] = [const { AtomicWaker::new() }; EP_COUNT];
 
+/// Buffer index for double buffering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+enum BufIdx {
+    Buf0 = 0,
+    Buf1 = 1,
+}
+
+impl BufIdx {
+    #[inline]
+    fn index(self) -> usize {
+        self as usize
+    }
+
+    /// Get the other buffer index.
+    #[inline]
+    fn other(self) -> Self {
+        match self {
+            BufIdx::Buf0 => BufIdx::Buf1,
+            BufIdx::Buf1 => BufIdx::Buf0,
+        }
+    }
+}
+
+/// Configuration for a single buffer in double-buffered mode.
+#[derive(Clone, Copy)]
+struct DoubleBufConfig {
+    pid: bool,
+    length: u16,
+    available: bool,
+    full: bool, // Only used for IN endpoints
+}
+
+impl DoubleBufConfig {
+    /// Create config by selecting values based on buffer index.
+    fn select(buf_idx: BufIdx, new_val: Self, current: Self) -> (Self, Self) {
+        match buf_idx {
+            BufIdx::Buf0 => (new_val, current),
+            BufIdx::Buf1 => (current, new_val),
+        }
+    }
+}
+
+/// Write to OUT buffer control register for double-buffered mode.
+/// Handles the required write-delay-write pattern per RP2040 datasheet.
+fn write_out_buffer_control_double<T: Instance>(
+    index: usize,
+    buf_idx: BufIdx,
+    pid: bool,
+    length: u16,
+    available: bool,
+    current: &pac::usb_dpram::regs::EpBufferControl,
+) {
+    let new_cfg = DoubleBufConfig {
+        pid,
+        length,
+        available: false, // First write without available
+        full: false,
+    };
+    let cur_cfg = DoubleBufConfig {
+        pid: current.pid(buf_idx.other().index()),
+        length: current.length(buf_idx.other().index()),
+        available: current.available(buf_idx.other().index()),
+        full: false,
+    };
+    let (buf0, buf1) = DoubleBufConfig::select(buf_idx, new_cfg, cur_cfg);
+
+    // First write without available bit
+    T::dpram().ep_out_buffer_control(index).write(|w| {
+        w.set_pid(0, buf0.pid);
+        w.set_length(0, buf0.length);
+        w.set_available(0, buf0.available);
+        w.set_pid(1, buf1.pid);
+        w.set_length(1, buf1.length);
+        w.set_available(1, buf1.available);
+    });
+
+    cortex_m::asm::delay(12);
+
+    // Second write with available bit set
+    let (buf0, buf1) = DoubleBufConfig::select(buf_idx, DoubleBufConfig { available, ..new_cfg }, cur_cfg);
+    T::dpram().ep_out_buffer_control(index).write(|w| {
+        w.set_pid(0, buf0.pid);
+        w.set_length(0, buf0.length);
+        w.set_available(0, buf0.available);
+        w.set_pid(1, buf1.pid);
+        w.set_length(1, buf1.length);
+        w.set_available(1, buf1.available);
+    });
+}
+
+/// Write to IN buffer control register for double-buffered mode.
+/// Handles the required write-delay-write pattern per RP2040 datasheet.
+fn write_in_buffer_control_double<T: Instance>(
+    index: usize,
+    buf_idx: BufIdx,
+    pid: bool,
+    length: u16,
+    full: bool,
+    available: bool,
+    current: &pac::usb_dpram::regs::EpBufferControl,
+) {
+    let new_cfg = DoubleBufConfig {
+        pid,
+        length,
+        available: false, // First write without available
+        full,
+    };
+    let cur_cfg = DoubleBufConfig {
+        pid: current.pid(buf_idx.other().index()),
+        length: current.length(buf_idx.other().index()),
+        available: current.available(buf_idx.other().index()),
+        full: current.full(buf_idx.other().index()),
+    };
+    let (buf0, buf1) = DoubleBufConfig::select(buf_idx, new_cfg, cur_cfg);
+
+    // First write without available bit
+    T::dpram().ep_in_buffer_control(index).write(|w| {
+        w.set_pid(0, buf0.pid);
+        w.set_length(0, buf0.length);
+        w.set_full(0, buf0.full);
+        w.set_available(0, buf0.available);
+        w.set_pid(1, buf1.pid);
+        w.set_length(1, buf1.length);
+        w.set_full(1, buf1.full);
+        w.set_available(1, buf1.available);
+    });
+
+    cortex_m::asm::delay(12);
+
+    // Second write with available bit set
+    let (buf0, buf1) = DoubleBufConfig::select(buf_idx, DoubleBufConfig { available, ..new_cfg }, cur_cfg);
+    T::dpram().ep_in_buffer_control(index).write(|w| {
+        w.set_pid(0, buf0.pid);
+        w.set_length(0, buf0.length);
+        w.set_full(0, buf0.full);
+        w.set_available(0, buf0.available);
+        w.set_pid(1, buf1.pid);
+        w.set_length(1, buf1.length);
+        w.set_full(1, buf1.full);
+        w.set_available(1, buf1.available);
+    });
+}
+
 struct EndpointBuffer<T: Instance> {
+    /// Base address of buffer 0 in DPRAM.
     addr: u16,
+    /// Length of each buffer (both buffers have the same size).
     len: u16,
+    /// Whether this endpoint uses double buffering.
+    double_buffered: bool,
     _phantom: PhantomData<T>,
 }
 
@@ -59,22 +207,52 @@ impl<T: Instance> EndpointBuffer<T> {
         Self {
             addr,
             len,
+            double_buffered: false,
             _phantom: PhantomData,
         }
     }
 
+    const fn new_double_buffered(addr: u16, len: u16) -> Self {
+        Self {
+            addr,
+            len,
+            double_buffered: true,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Get the address of the specified buffer.
+    #[inline]
+    fn buf_addr(&self, idx: BufIdx) -> u16 {
+        match idx {
+            BufIdx::Buf0 => self.addr,
+            // Buffer 1 is immediately after buffer 0
+            BufIdx::Buf1 => self.addr + self.len,
+        }
+    }
+
     fn read(&mut self, buf: &mut [u8]) {
+        self.read_buf(BufIdx::Buf0, buf);
+    }
+
+    fn read_buf(&mut self, idx: BufIdx, buf: &mut [u8]) {
         assert!(buf.len() <= self.len as usize);
         compiler_fence(Ordering::SeqCst);
-        let mem = unsafe { slice::from_raw_parts(EP_MEMORY.add(self.addr as _), buf.len()) };
+        let addr = self.buf_addr(idx);
+        let mem = unsafe { slice::from_raw_parts(EP_MEMORY.add(addr as _), buf.len()) };
         buf.copy_from_slice(mem);
         compiler_fence(Ordering::SeqCst);
     }
 
     fn write(&mut self, buf: &[u8]) {
+        self.write_buf(BufIdx::Buf0, buf);
+    }
+
+    fn write_buf(&mut self, idx: BufIdx, buf: &[u8]) {
         assert!(buf.len() <= self.len as usize);
         compiler_fence(Ordering::SeqCst);
-        let mem = unsafe { slice::from_raw_parts_mut(EP_MEMORY.add(self.addr as _), buf.len()) };
+        let addr = self.buf_addr(idx);
+        let mem = unsafe { slice::from_raw_parts_mut(EP_MEMORY.add(addr as _), buf.len()) };
         mem.copy_from_slice(buf);
         compiler_fence(Ordering::SeqCst);
     }
@@ -86,6 +264,7 @@ struct EndpointData {
     ep_type: EndpointType, // only valid if used
     max_packet_size: u16,
     used: bool,
+    double_buffered: bool,
 }
 
 impl EndpointData {
@@ -94,6 +273,7 @@ impl EndpointData {
             ep_type: EndpointType::Bulk,
             max_packet_size: 0,
             used: false,
+            double_buffered: false,
         }
     }
 }
@@ -157,12 +337,19 @@ impl<'d, T: Instance> Driver<'d, T> {
         max_packet_size: u16,
         interval_ms: u8,
     ) -> Result<Endpoint<'d, T, D>, driver::EndpointAllocError> {
+        // Enable double buffering for bulk endpoints to improve throughput.
+        // Control endpoints don't benefit from double buffering.
+        // Interrupt endpoints typically have small, infrequent transfers.
+        // Isochronous could benefit but requires special offset handling.
+        let double_buffered = ep_type == EndpointType::Bulk;
+
         trace!(
-            "allocating type={:?} mps={:?} interval_ms={}, dir={:?}",
+            "allocating type={:?} mps={:?} interval_ms={}, dir={:?}, double_buffered={}",
             ep_type,
             max_packet_size,
             interval_ms,
-            D::dir()
+            D::dir(),
+            double_buffered
         );
 
         let alloc = match D::dir() {
@@ -204,24 +391,31 @@ impl<'d, T: Instance> Driver<'d, T> {
         // to allocate smaller chunks to save memory.
         let len = (max_packet_size + 63) / 64 * 64;
 
+        // For double buffering, allocate space for two buffers.
+        let total_len = if double_buffered { len * 2 } else { len };
+
         let addr = self.ep_mem_free;
-        if addr + len > EP_MEMORY_SIZE as u16 {
+        if addr + total_len > EP_MEMORY_SIZE as u16 {
             warn!("Endpoint memory full");
             return Err(EndpointAllocError);
         }
-        self.ep_mem_free += len;
+        self.ep_mem_free += total_len;
 
-        let buf = EndpointBuffer {
-            addr,
-            len,
-            _phantom: PhantomData,
+        let buf = if double_buffered {
+            EndpointBuffer::new_double_buffered(addr, len)
+        } else {
+            EndpointBuffer::new(addr, len)
         };
 
-        trace!("  index={} addr={} len={}", index, buf.addr, buf.len);
+        trace!(
+            "  index={} addr={} len={} double_buffered={}",
+            index, buf.addr, buf.len, double_buffered
+        );
 
         ep.ep_type = ep_type;
         ep.used = true;
         ep.max_packet_size = max_packet_size;
+        ep.double_buffered = double_buffered;
 
         let ep_type_reg = match ep_type {
             EndpointType::Bulk => pac::usb_dpram::vals::EpControlEndpointType::BULK,
@@ -236,12 +430,14 @@ impl<'d, T: Instance> Driver<'d, T> {
                 w.set_buffer_address(addr);
                 w.set_interrupt_per_buff(true);
                 w.set_endpoint_type(ep_type_reg);
+                w.set_double_buffered(double_buffered);
             }),
             Direction::In => T::dpram().ep_in_control(index - 1).write(|w| {
                 w.set_enable(false);
                 w.set_buffer_address(addr);
                 w.set_interrupt_per_buff(true);
                 w.set_endpoint_type(ep_type_reg);
+                w.set_double_buffered(double_buffered);
             }),
         }
 
@@ -353,6 +549,7 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
             Bus {
                 phantom: PhantomData,
                 inited: false,
+                ep_in: self.ep_in,
                 ep_out: self.ep_out,
             },
             ControlPipe {
@@ -366,6 +563,7 @@ impl<'d, T: Instance> driver::Driver<'d> for Driver<'d, T> {
 /// Type representing the RP USB bus.
 pub struct Bus<'d, T: Instance> {
     phantom: PhantomData<&'d mut T>,
+    ep_in: [EndpointData; EP_COUNT],
     ep_out: [EndpointData; EP_COUNT],
     inited: bool,
 }
@@ -474,25 +672,58 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
         let n = ep_addr.index();
         match ep_addr.direction() {
             Direction::In => {
+                let ep_data = &self.ep_in[n];
                 T::dpram().ep_in_control(n - 1).modify(|w| w.set_enable(enabled));
-                T::dpram().ep_in_buffer_control(ep_addr.index()).write(|w| {
-                    w.set_pid(0, true); // first packet is DATA0, but PID is flipped before
-                });
+
+                if ep_data.double_buffered {
+                    // For double-buffered IN endpoints, initialize both buffers.
+                    // PID starts at DATA0, alternating between buffers.
+                    T::dpram().ep_in_buffer_control(n).write(|w| {
+                        w.set_pid(0, true); // Will be flipped to DATA0 on first write
+                        w.set_pid(1, false); // DATA1 for second buffer
+                    });
+                } else {
+                    T::dpram().ep_in_buffer_control(n).write(|w| {
+                        w.set_pid(0, true); // first packet is DATA0, but PID is flipped before
+                    });
+                }
                 EP_IN_WAKERS[n].wake();
             }
             Direction::Out => {
+                let ep_data = &self.ep_out[n];
                 T::dpram().ep_out_control(n - 1).modify(|w| w.set_enable(enabled));
 
-                T::dpram().ep_out_buffer_control(ep_addr.index()).write(|w| {
-                    w.set_pid(0, false);
-                    w.set_length(0, self.ep_out[n].max_packet_size);
-                });
-                cortex_m::asm::delay(12);
-                T::dpram().ep_out_buffer_control(ep_addr.index()).write(|w| {
-                    w.set_pid(0, false);
-                    w.set_length(0, self.ep_out[n].max_packet_size);
-                    w.set_available(0, true);
-                });
+                if ep_data.double_buffered {
+                    // For double-buffered OUT endpoints, make both buffers available.
+                    // This allows continuous reception without gaps.
+                    let mps = ep_data.max_packet_size;
+                    T::dpram().ep_out_buffer_control(n).write(|w| {
+                        w.set_pid(0, false); // DATA0
+                        w.set_length(0, mps);
+                        w.set_pid(1, true); // DATA1
+                        w.set_length(1, mps);
+                    });
+                    cortex_m::asm::delay(12);
+                    T::dpram().ep_out_buffer_control(n).write(|w| {
+                        w.set_pid(0, false);
+                        w.set_length(0, mps);
+                        w.set_available(0, true);
+                        w.set_pid(1, true);
+                        w.set_length(1, mps);
+                        w.set_available(1, true);
+                    });
+                } else {
+                    T::dpram().ep_out_buffer_control(n).write(|w| {
+                        w.set_pid(0, false);
+                        w.set_length(0, ep_data.max_packet_size);
+                    });
+                    cortex_m::asm::delay(12);
+                    T::dpram().ep_out_buffer_control(n).write(|w| {
+                        w.set_pid(0, false);
+                        w.set_length(0, ep_data.max_packet_size);
+                        w.set_available(0, true);
+                    });
+                }
                 EP_OUT_WAKERS[n].wake();
             }
         }
@@ -572,40 +803,96 @@ impl<'d, T: Instance> driver::Endpoint for Endpoint<'d, T, Out> {
 
 impl<'d, T: Instance> driver::EndpointOut for Endpoint<'d, T, Out> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, EndpointError> {
-        trace!("READ WAITING, buf.len() = {}", buf.len());
         let index = self.info.addr.index();
-        let val = poll_fn(|cx| {
-            EP_OUT_WAKERS[index].register(cx.waker());
-            let val = T::dpram().ep_out_buffer_control(index).read();
-            if val.available(0) {
+
+        if self.buf.double_buffered {
+            // Double-buffered read: wait for either buffer to have data.
+            trace!("READ WAITING (double-buffered), buf.len() = {}", buf.len());
+
+            let (buf_idx, val) = poll_fn(|cx| {
+                EP_OUT_WAKERS[index].register(cx.waker());
+                let val = T::dpram().ep_out_buffer_control(index).read();
+
+                // Check if either buffer has completed (available cleared by hardware).
+                // Use BUFF_CPU_SHOULD_HANDLE to determine which buffer to process.
+                let buf0_ready = !val.available(0);
+                let buf1_ready = !val.available(1);
+
+                if buf0_ready || buf1_ready {
+                    let should_handle = T::regs().buff_cpu_should_handle().read();
+                    let preferred = if should_handle.ep_out(index) {
+                        BufIdx::Buf1
+                    } else {
+                        BufIdx::Buf0
+                    };
+
+                    // Try the preferred buffer first, fall back to the other if not ready.
+                    let buf_idx = if !val.available(preferred.index()) {
+                        preferred
+                    } else {
+                        // Preferred not ready, use the other one (which must be ready).
+                        preferred.other()
+                    };
+
+                    return Poll::Ready((buf_idx, val));
+                }
                 Poll::Pending
-            } else {
-                Poll::Ready(val)
+            })
+            .await;
+
+            let rx_len = val.length(buf_idx.index()) as usize;
+            if rx_len > buf.len() {
+                return Err(EndpointError::BufferOverflow);
             }
-        })
-        .await;
 
-        let rx_len = val.length(0) as usize;
-        if rx_len > buf.len() {
-            return Err(EndpointError::BufferOverflow);
+            self.buf.read_buf(buf_idx, &mut buf[..rx_len]);
+            trace!("READ OK (buf{}), rx_len = {}", buf_idx.index(), rx_len);
+
+            // Toggle PID for next transfer on this buffer and make it available again.
+            let pid = !val.pid(buf_idx.index());
+            let mps = self.info.max_packet_size;
+            let current = T::dpram().ep_out_buffer_control(index).read();
+
+            write_out_buffer_control_double::<T>(index, buf_idx, pid, mps, true, &current);
+
+            Ok(rx_len)
+        } else {
+            // Single-buffered read (original implementation).
+            trace!("READ WAITING, buf.len() = {}", buf.len());
+
+            let val = poll_fn(|cx| {
+                EP_OUT_WAKERS[index].register(cx.waker());
+                let val = T::dpram().ep_out_buffer_control(index).read();
+                if val.available(0) {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(val)
+                }
+            })
+            .await;
+
+            let rx_len = val.length(0) as usize;
+            if rx_len > buf.len() {
+                return Err(EndpointError::BufferOverflow);
+            }
+            self.buf.read(&mut buf[..rx_len]);
+
+            trace!("READ OK, rx_len = {}", rx_len);
+
+            let pid = !val.pid(0);
+            T::dpram().ep_out_buffer_control(index).write(|w| {
+                w.set_pid(0, pid);
+                w.set_length(0, self.info.max_packet_size);
+            });
+            cortex_m::asm::delay(12);
+            T::dpram().ep_out_buffer_control(index).write(|w| {
+                w.set_pid(0, pid);
+                w.set_length(0, self.info.max_packet_size);
+                w.set_available(0, true);
+            });
+
+            Ok(rx_len)
         }
-        self.buf.read(&mut buf[..rx_len]);
-
-        trace!("READ OK, rx_len = {}", rx_len);
-
-        let pid = !val.pid(0);
-        T::dpram().ep_out_buffer_control(index).write(|w| {
-            w.set_pid(0, pid);
-            w.set_length(0, self.info.max_packet_size);
-        });
-        cortex_m::asm::delay(12);
-        T::dpram().ep_out_buffer_control(index).write(|w| {
-            w.set_pid(0, pid);
-            w.set_length(0, self.info.max_packet_size);
-            w.set_available(0, true);
-        });
-
-        Ok(rx_len)
     }
 }
 
@@ -615,39 +902,88 @@ impl<'d, T: Instance> driver::EndpointIn for Endpoint<'d, T, In> {
             return Err(EndpointError::BufferOverflow);
         }
 
-        trace!("WRITE WAITING");
-
         let index = self.info.addr.index();
-        let val = poll_fn(|cx| {
-            EP_IN_WAKERS[index].register(cx.waker());
-            let val = T::dpram().ep_in_buffer_control(index).read();
-            if val.available(0) {
+
+        if self.buf.double_buffered {
+            // Double-buffered write: wait for either buffer to be free.
+            trace!("WRITE WAITING (double-buffered), len = {}", buf.len());
+
+            let (buf_idx, val) = poll_fn(|cx| {
+                EP_IN_WAKERS[index].register(cx.waker());
+                let val = T::dpram().ep_in_buffer_control(index).read();
+
+                // Check if either buffer is free (available cleared by hardware after send).
+                let buf0_free = !val.available(0);
+                let buf1_free = !val.available(1);
+
+                if buf0_free || buf1_free {
+                    let should_handle = T::regs().buff_cpu_should_handle().read();
+                    let preferred = if should_handle.ep_in(index) {
+                        BufIdx::Buf1
+                    } else {
+                        BufIdx::Buf0
+                    };
+
+                    // Try the preferred buffer first, fall back to the other if not free.
+                    let buf_idx = if !val.available(preferred.index()) {
+                        preferred
+                    } else {
+                        // Preferred not free, use the other one (which must be free).
+                        preferred.other()
+                    };
+
+                    return Poll::Ready((buf_idx, val));
+                }
                 Poll::Pending
-            } else {
-                Poll::Ready(val)
-            }
-        })
-        .await;
+            })
+            .await;
 
-        self.buf.write(buf);
+            // Write data to the selected buffer.
+            self.buf.write_buf(buf_idx, buf);
 
-        let pid = !val.pid(0);
-        T::dpram().ep_in_buffer_control(index).write(|w| {
-            w.set_pid(0, pid);
-            w.set_length(0, buf.len() as _);
-            w.set_full(0, true);
-        });
-        cortex_m::asm::delay(12);
-        T::dpram().ep_in_buffer_control(index).write(|w| {
-            w.set_pid(0, pid);
-            w.set_length(0, buf.len() as _);
-            w.set_full(0, true);
-            w.set_available(0, true);
-        });
+            // Toggle PID and mark buffer as full and available.
+            let pid = !val.pid(buf_idx.index());
+            let len = buf.len() as u16;
+            let current = T::dpram().ep_in_buffer_control(index).read();
 
-        trace!("WRITE OK");
+            write_in_buffer_control_double::<T>(index, buf_idx, pid, len, true, true, &current);
 
-        Ok(())
+            trace!("WRITE OK (buf{})", buf_idx.index());
+            Ok(())
+        } else {
+            // Single-buffered write (original implementation).
+            trace!("WRITE WAITING, len = {}", buf.len());
+
+            let val = poll_fn(|cx| {
+                EP_IN_WAKERS[index].register(cx.waker());
+                let val = T::dpram().ep_in_buffer_control(index).read();
+                if val.available(0) {
+                    Poll::Pending
+                } else {
+                    Poll::Ready(val)
+                }
+            })
+            .await;
+
+            self.buf.write(buf);
+
+            let pid = !val.pid(0);
+            T::dpram().ep_in_buffer_control(index).write(|w| {
+                w.set_pid(0, pid);
+                w.set_length(0, buf.len() as _);
+                w.set_full(0, true);
+            });
+            cortex_m::asm::delay(12);
+            T::dpram().ep_in_buffer_control(index).write(|w| {
+                w.set_pid(0, pid);
+                w.set_length(0, buf.len() as _);
+                w.set_full(0, true);
+                w.set_available(0, true);
+            });
+
+            trace!("WRITE OK");
+            Ok(())
+        }
     }
 }
 
