@@ -54,8 +54,7 @@ fn reset_double_buffered_in<T: Instance>(index: usize) {
         });
         update_buffer_half::<T>(Direction::In, index, 1, |w| w.0 = 0);
         // No atomic RMW on thumbv6m; serialize with the endpoint's packet handoff.
-        let generation = &EP_IN_RESET_GENERATION[index];
-        generation.store(generation.load(Ordering::Relaxed).wrapping_add(1), Ordering::Release);
+        reset_in_generation(index);
     });
 }
 
@@ -82,8 +81,95 @@ fn reset_double_buffered_out<T: Instance>(index: usize, max_packet_size: u16, ar
     });
 }
 
+// Caller holds a critical section, serializing reset with packet handoff.
+fn reset_in_generation(index: usize) {
+    let generation = &EP_IN_RESET_GENERATION[index];
+    generation.store(generation.load(Ordering::Relaxed).wrapping_add(1), Ordering::Release);
+}
+
+fn set_endpoint_stalled<T: Instance>(
+    address: EndpointAddress,
+    max_packet_size: u16,
+    double_buffered: bool,
+    stalled: bool,
+) {
+    let index = address.index();
+    critical_section::with(|_| {
+        let control = match address.direction() {
+            Direction::In => T::dpram().ep_in_buffer_control(index),
+            Direction::Out => T::dpram().ep_out_buffer_control(index),
+        };
+        if index == 0 {
+            T::regs().ep_stall_arm().modify(|w| {
+                if address.is_in() {
+                    w.set_ep0_in(stalled);
+                } else {
+                    w.set_ep0_out(stalled);
+                }
+            });
+            if stalled {
+                control.write(|w| w.set_stall(true));
+            } else {
+                control.modify(|w| w.set_stall(false));
+            }
+            return;
+        }
+        let endpoint = match address.direction() {
+            Direction::In => T::dpram().ep_in_control(index - 1),
+            Direction::Out => T::dpram().ep_out_control(index - 1),
+        };
+        if T::regs().sie_status().read().bus_reset() || !endpoint.read().enable() {
+            return;
+        }
+        if double_buffered {
+            // Stop hardware before reclaiming both halves. A software critical
+            // section alone cannot prevent USB from consuming an armed buffer.
+            endpoint.modify(|w| w.set_enable(false));
+            match address.direction() {
+                Direction::In => reset_double_buffered_in::<T>(index),
+                Direction::Out => reset_double_buffered_out::<T>(index, max_packet_size, !stalled),
+            }
+            if stalled {
+                control.modify(|w| w.set_stall(true));
+            }
+            endpoint.modify(|w| w.set_enable(true));
+        } else if stalled {
+            // Drop AVAILABLE as well as setting STALL, discarding an in-flight packet.
+            control.write(|w| w.set_stall(true));
+            if address.is_in() {
+                reset_in_generation(index);
+            }
+        } else {
+            match address.direction() {
+                Direction::In => {
+                    control.write(|w| w.set_pid(0, true));
+                    reset_in_generation(index);
+                }
+                Direction::Out => {
+                    control.write(|w| {
+                        w.set_pid(0, false);
+                        w.set_length(0, max_packet_size);
+                    });
+                    cortex_m::asm::delay(12);
+                    control.write(|w| {
+                        w.set_pid(0, false);
+                        w.set_length(0, max_packet_size);
+                        w.set_available(0, true);
+                    });
+                }
+            }
+        }
+    });
+    let wakers = if address.is_in() { &EP_IN_WAKERS } else { &EP_OUT_WAKERS };
+    wakers[index].wake();
+}
+
+fn in_drained(control: pac::usb_dpram::regs::EpBufferControl, double_buffered: bool) -> bool {
+    !control.available(0) && (!double_buffered || !control.available(1))
+}
+
 static BUS_WAKER: AtomicWaker = AtomicWaker::new();
-// Bumped by `reset_double_buffered_{in,out}`, so the endpoint notices the hardware reset.
+// Bumped by endpoint halt/enable/reset, so packet I/O and completion observe the same epoch.
 static EP_IN_RESET_GENERATION: [AtomicU32; EP_COUNT] = [const { AtomicU32::new(0) }; EP_COUNT];
 static EP_OUT_RESET_GENERATION: [AtomicU32; EP_COUNT] = [const { AtomicU32::new(0) }; EP_COUNT];
 static EP_IN_WAKERS: [AtomicWaker; EP_COUNT] = [const { AtomicWaker::new() }; EP_COUNT];
@@ -330,13 +416,13 @@ impl<'d, T: Instance> Driver<'d, T> {
                 interval_ms,
             },
             buf,
+            reset_generation: match D::dir() {
+                Direction::In => EP_IN_RESET_GENERATION[index].load(Ordering::Relaxed),
+                Direction::Out => EP_OUT_RESET_GENERATION[index].load(Ordering::Relaxed),
+            },
             double_buffer: double_buffered.then(|| DoubleBuffer {
                 next_buf: 0,
                 next_pid: false,
-                reset_generation: match D::dir() {
-                    Direction::In => EP_IN_RESET_GENERATION[index].load(Ordering::Relaxed),
-                    Direction::Out => EP_OUT_RESET_GENERATION[index].load(Ordering::Relaxed),
-                },
             }),
         })
     }
@@ -502,6 +588,8 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
                         if self.double_in & (1 << i) != 0 {
                             T::dpram().ep_in_control(i - 1).modify(|w| w.set_enable(false));
                             reset_double_buffered_in::<T>(i);
+                        } else {
+                            reset_in_generation(i);
                         }
                         if self.double_out & (1 << i) != 0 {
                             T::dpram().ep_out_control(i - 1).modify(|w| w.set_enable(false));
@@ -550,66 +638,18 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
     }
 
     fn endpoint_set_stalled(&mut self, ep_addr: EndpointAddress, stalled: bool) {
-        let n = ep_addr.index();
-
-        if n == 0 {
-            T::regs().ep_stall_arm().modify(|w| {
-                if ep_addr.is_in() {
-                    w.set_ep0_in(stalled);
-                } else {
-                    w.set_ep0_out(stalled);
-                }
-            });
-        }
-
-        let ctrl = if ep_addr.is_in() {
-            T::dpram().ep_in_buffer_control(n)
-        } else {
-            T::dpram().ep_out_buffer_control(n)
-        };
-
         let double_buffered = (if ep_addr.is_in() {
             self.double_in
         } else {
             self.double_out
-        }) & (1 << n)
+        }) & (1 << ep_addr.index())
             != 0;
-
-        match (stalled, ep_addr.direction()) {
-            (true, _) if double_buffered => critical_section::with(|_| ctrl.write(|w| w.set_stall(true))),
-            // write, not modify: clears AVAILABLE so an in-flight packet can't complete instead of stalling.
-            (true, _) => ctrl.write(|w| w.set_stall(true)),
-
-            // the control pipe resets EP0's toggle on every SETUP, so only drop the stall.
-            (false, _) if n == 0 => ctrl.modify(|w| w.set_stall(false)),
-
-            // clearing a halt resets the toggle to DATA0 (USB 2.0 §9.4.5).
-            (false, Direction::In) if double_buffered => reset_double_buffered_in::<T>(n),
-
-            // same, but PID is flipped before use.
-            (false, Direction::In) => ctrl.write(|w| w.set_pid(0, true)),
-
-            (false, Direction::Out) if double_buffered => {
-                reset_double_buffered_out::<T>(n, self.ep_out[n].max_packet_size, true);
-            }
-
-            // same, plus re-arm the buffer that stalling un-armed.
-            (false, Direction::Out) => {
-                ctrl.write(|w| {
-                    w.set_pid(0, false);
-                    w.set_length(0, self.ep_out[n].max_packet_size);
-                });
-                cortex_m::asm::delay(12);
-                ctrl.write(|w| {
-                    w.set_pid(0, false);
-                    w.set_length(0, self.ep_out[n].max_packet_size);
-                    w.set_available(0, true);
-                });
-            }
-        }
-
-        let wakers = if ep_addr.is_in() { &EP_IN_WAKERS } else { &EP_OUT_WAKERS };
-        wakers[n].wake();
+        set_endpoint_stalled::<T>(
+            ep_addr,
+            self.ep_out[ep_addr.index()].max_packet_size,
+            double_buffered,
+            stalled,
+        );
     }
 
     fn endpoint_is_stalled(&mut self, ep_addr: EndpointAddress) -> bool {
@@ -641,9 +681,12 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
                 EP_IN_WAKERS[n].wake();
             }
             Direction::In => {
-                T::dpram().ep_in_control(n - 1).modify(|w| w.set_enable(enabled));
-                T::dpram().ep_in_buffer_control(ep_addr.index()).write(|w| {
-                    w.set_pid(0, true); // first packet is DATA0, but PID is flipped before
+                critical_section::with(|_| {
+                    T::dpram().ep_in_control(n - 1).modify(|w| w.set_enable(enabled));
+                    T::dpram().ep_in_buffer_control(n).write(|w| {
+                        w.set_pid(0, true); // first packet is DATA0, but PID is flipped before
+                    });
+                    reset_in_generation(n);
                 });
                 EP_IN_WAKERS[n].wake();
             }
@@ -701,7 +744,40 @@ pub struct Endpoint<'d, T: Instance, D> {
     _phantom: PhantomData<(&'d mut T, D)>,
     info: EndpointInfo,
     buf: EndpointBuffer<T>,
+    // Last epoch used for packet I/O; completion must not cross a recovery/reset.
+    reset_generation: u32,
     double_buffer: Option<DoubleBuffer>,
+}
+
+/// A handle for halting or recovering an allocated endpoint from another task.
+///
+/// The driver keeps hardware buffer ownership and software state synchronized.
+/// The handle cannot enable an endpoint disabled by the USB bus.
+pub struct EndpointControl<'d, T: Instance> {
+    _phantom: PhantomData<&'d mut T>,
+    info: EndpointInfo,
+    double_buffered: bool,
+}
+
+impl<'d, T: Instance> EndpointControl<'d, T> {
+    /// Set or clear the endpoint halt, discarding queued packets.
+    ///
+    /// Clearing the halt resets the DATA toggle to DATA0 and re-arms OUT reception.
+    /// This is a no-op while the endpoint is disabled or a bus reset is pending.
+    pub fn set_stalled(&self, stalled: bool) {
+        set_endpoint_stalled::<T>(self.info.addr, self.info.max_packet_size, self.double_buffered, stalled);
+    }
+}
+
+impl<'d, T: Instance, D> Endpoint<'d, T, D> {
+    /// Obtain a control handle without moving the packet endpoint to another task.
+    pub fn control(&self) -> EndpointControl<'d, T> {
+        EndpointControl {
+            _phantom: PhantomData,
+            info: self.info,
+            double_buffered: self.double_buffer.is_some(),
+        }
+    }
 }
 
 /// Software state of a double-buffered bulk endpoint.
@@ -710,8 +786,6 @@ struct DoubleBuffer {
     next_buf: usize,
     /// DATA PID of the next IN packet.
     next_pid: bool,
-    /// Last seen value of the endpoint's reset generation.
-    reset_generation: u32,
 }
 
 impl<'d, T: Instance> driver::Endpoint for Endpoint<'d, T, In> {
@@ -764,8 +838,8 @@ impl<'d, T: Instance> Endpoint<'d, T, Out> {
                     unreachable!()
                 };
                 let generation = EP_OUT_RESET_GENERATION[index].load(Ordering::Acquire);
-                if state.reset_generation != generation {
-                    state.reset_generation = generation;
+                if self.reset_generation != generation {
+                    self.reset_generation = generation;
                     state.next_buf = 0;
                 }
                 let buffer = state.next_buf;
@@ -849,41 +923,73 @@ impl<'d, T: Instance> driver::EndpointIn for Endpoint<'d, T, In> {
         trace!("WRITE WAITING");
 
         let index = self.info.addr.index();
-        let val = poll_fn(|cx| {
+        poll_fn(|cx| {
             EP_IN_WAKERS[index].register(cx.waker());
-            let val = T::dpram().ep_in_buffer_control(index).read();
-            // stay parked while stalled, otherwise the write below would clear the stall.
-            if val.available(0) || val.stall() {
-                Poll::Pending
-            } else {
-                Poll::Ready(val)
-            }
+            critical_section::with(|_| {
+                if T::regs().sie_status().read().bus_reset() || !T::dpram().ep_in_control(index - 1).read().enable() {
+                    return Poll::Ready(Err(EndpointError::Disabled));
+                }
+                let control = T::dpram().ep_in_buffer_control(index);
+                let val = control.read();
+                if val.available(0) || val.stall() {
+                    return Poll::Pending;
+                }
+                self.buf.write(buf);
+                let pid = !val.pid(0);
+                control.write(|w| {
+                    w.set_pid(0, pid);
+                    w.set_length(0, buf.len() as _);
+                    w.set_full(0, true);
+                });
+                cortex_m::asm::delay(12);
+                control.write(|w| {
+                    w.set_pid(0, pid);
+                    w.set_length(0, buf.len() as _);
+                    w.set_full(0, true);
+                    w.set_available(0, true);
+                });
+                self.reset_generation = EP_IN_RESET_GENERATION[index].load(Ordering::Acquire);
+                trace!("WRITE OK");
+                Poll::Ready(Ok(()))
+            })
         })
-        .await;
-
-        self.buf.write(buf);
-
-        let pid = !val.pid(0);
-        T::dpram().ep_in_buffer_control(index).write(|w| {
-            w.set_pid(0, pid);
-            w.set_length(0, buf.len() as _);
-            w.set_full(0, true);
-        });
-        cortex_m::asm::delay(12);
-        T::dpram().ep_in_buffer_control(index).write(|w| {
-            w.set_pid(0, pid);
-            w.set_length(0, buf.len() as _);
-            w.set_full(0, true);
-            w.set_available(0, true);
-        });
-
-        trace!("WRITE OK");
-
-        Ok(())
+        .await
     }
 }
 
 impl<'d, T: Instance> Endpoint<'d, T, In> {
+    /// Wait until the controller has released all queued IN buffers.
+    ///
+    /// For bulk and interrupt endpoints, completion means a USB host ACK, not
+    /// consumption by the host application. Isochronous transfers have no ACK
+    /// and this cannot guarantee delivery.
+    /// Does not send a zero-length packet or discard packets. This future is
+    /// cancel-safe. Returns `Disabled` if the endpoint is halted, disabled or
+    /// reset since the last write, rather than reporting discarded data as sent.
+    pub async fn wait_complete(&mut self) -> Result<(), EndpointError> {
+        let index = self.info.addr.index();
+        let generation = self.reset_generation;
+        poll_fn(|cx| {
+            EP_IN_WAKERS[index].register(cx.waker());
+            critical_section::with(|_| {
+                let control = T::dpram().ep_in_buffer_control(index).read();
+                if T::regs().sie_status().read().bus_reset()
+                    || !T::dpram().ep_in_control(index - 1).read().enable()
+                    || control.stall()
+                    || EP_IN_RESET_GENERATION[index].load(Ordering::Acquire) != generation
+                {
+                    return Poll::Ready(Err(EndpointError::Disabled));
+                }
+                if in_drained(control, self.double_buffer.is_some()) {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            })
+        })
+        .await
+    }
+
     async fn write_double_buffered(&mut self, buf: &[u8]) -> Result<(), EndpointError> {
         let index = self.info.addr.index();
         let buffer_index = poll_fn(|cx| {
@@ -895,8 +1001,8 @@ impl<'d, T: Instance> Endpoint<'d, T, In> {
                 unreachable!()
             };
             let generation = EP_IN_RESET_GENERATION[index].load(Ordering::Acquire);
-            if state.reset_generation != generation {
-                state.reset_generation = generation;
+            if self.reset_generation != generation {
+                self.reset_generation = generation;
                 state.next_buf = 0;
                 state.next_pid = false;
             }
@@ -917,7 +1023,7 @@ impl<'d, T: Instance> Endpoint<'d, T, In> {
             };
             if T::regs().sie_status().read().bus_reset()
                 || !T::dpram().ep_in_control(index - 1).read().enable()
-                || EP_IN_RESET_GENERATION[index].load(Ordering::Acquire) != state.reset_generation
+                || EP_IN_RESET_GENERATION[index].load(Ordering::Acquire) != self.reset_generation
             {
                 return Err(EndpointError::Disabled);
             }
@@ -942,6 +1048,29 @@ impl<'d, T: Instance> Endpoint<'d, T, In> {
             trace!("WRITE OK");
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_drained;
+    use crate::pac::usb_dpram::regs::EpBufferControl;
+
+    #[test]
+    fn drain_waits_for_each_queued_packet() {
+        for double_buffered in [false, true] {
+            for first in [false, true] {
+                for second in [false, true] {
+                    let mut control = EpBufferControl(0);
+                    control.set_available(0, first);
+                    control.set_available(1, second);
+                    assert_eq!(
+                        in_drained(control, double_buffered),
+                        !first && (!double_buffered || !second)
+                    );
+                }
+            }
+        }
     }
 }
 
