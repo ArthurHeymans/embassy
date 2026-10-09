@@ -121,10 +121,10 @@ fn set_endpoint_stalled<T: Instance>(
         if T::regs().sie_status().read().bus_reset() || !endpoint.read().enable() {
             return;
         }
+        // Stop hardware before reclaiming buffers. A software critical section
+        // alone cannot prevent USB from accessing an armed buffer.
+        endpoint.modify(|w| w.set_enable(false));
         if double_buffered {
-            // Stop hardware before reclaiming both halves. A software critical
-            // section alone cannot prevent USB from consuming an armed buffer.
-            endpoint.modify(|w| w.set_enable(false));
             match address.direction() {
                 Direction::In => reset_double_buffered_in::<T>(index),
                 Direction::Out => reset_double_buffered_out::<T>(index, max_packet_size, !stalled),
@@ -132,7 +132,6 @@ fn set_endpoint_stalled<T: Instance>(
             if stalled {
                 control.modify(|w| w.set_stall(true));
             }
-            endpoint.modify(|w| w.set_enable(true));
         } else if stalled {
             // Drop AVAILABLE as well as setting STALL, discarding an in-flight packet.
             control.write(|w| w.set_stall(true));
@@ -159,6 +158,7 @@ fn set_endpoint_stalled<T: Instance>(
                 }
             }
         }
+        endpoint.modify(|w| w.set_enable(true));
     });
     let wakers = if address.is_in() { &EP_IN_WAKERS } else { &EP_OUT_WAKERS };
     wakers[index].wake();
@@ -699,17 +699,21 @@ impl<'d, T: Instance> driver::Bus for Bus<'d, T> {
                 EP_OUT_WAKERS[n].wake();
             }
             Direction::Out => {
-                T::dpram().ep_out_control(n - 1).modify(|w| w.set_enable(enabled));
-
-                T::dpram().ep_out_buffer_control(ep_addr.index()).write(|w| {
-                    w.set_pid(0, false);
-                    w.set_length(0, self.ep_out[n].max_packet_size);
-                });
-                cortex_m::asm::delay(12);
-                T::dpram().ep_out_buffer_control(ep_addr.index()).write(|w| {
-                    w.set_pid(0, false);
-                    w.set_length(0, self.ep_out[n].max_packet_size);
-                    w.set_available(0, true);
+                critical_section::with(|_| {
+                    T::dpram().ep_out_control(n - 1).modify(|w| w.set_enable(false));
+                    T::dpram().ep_out_buffer_control(n).write(|w| {
+                        w.set_pid(0, false);
+                        w.set_length(0, self.ep_out[n].max_packet_size);
+                    });
+                    if enabled {
+                        cortex_m::asm::delay(12);
+                        T::dpram().ep_out_buffer_control(n).write(|w| {
+                            w.set_pid(0, false);
+                            w.set_length(0, self.ep_out[n].max_packet_size);
+                            w.set_available(0, true);
+                        });
+                    }
+                    T::dpram().ep_out_control(n - 1).modify(|w| w.set_enable(enabled));
                 });
                 EP_OUT_WAKERS[n].wake();
             }
@@ -875,39 +879,40 @@ impl<'d, T: Instance> driver::EndpointOut for Endpoint<'d, T, Out> {
 
         trace!("READ WAITING, buf.len() = {}", buf.len());
         let index = self.info.addr.index();
-        let val = poll_fn(|cx| {
+        poll_fn(|cx| {
             EP_OUT_WAKERS[index].register(cx.waker());
-            let val = T::dpram().ep_out_buffer_control(index).read();
-            // stay parked while stalled, otherwise the re-arm below would clear the stall.
-            if val.available(0) || val.stall() {
-                Poll::Pending
-            } else {
-                Poll::Ready(val)
-            }
+            // Endpoint control may run on another core or in an interrupt.
+            // Serialize copying and re-arming with halt/reset, as in double-buffer mode.
+            critical_section::with(|_| {
+                if T::regs().sie_status().read().bus_reset() || !T::dpram().ep_out_control(index - 1).read().enable() {
+                    return Poll::Ready(Err(EndpointError::Disabled));
+                }
+                let control = T::dpram().ep_out_buffer_control(index);
+                let val = control.read();
+                if val.available(0) || val.stall() || !val.full(0) {
+                    return Poll::Pending;
+                }
+                let rx_len = val.length(0) as usize;
+                if rx_len > buf.len() {
+                    return Poll::Ready(Err(EndpointError::BufferOverflow));
+                }
+                self.buf.read(&mut buf[..rx_len]);
+                let pid = !val.pid(0);
+                control.write(|w| {
+                    w.set_pid(0, pid);
+                    w.set_length(0, self.info.max_packet_size);
+                });
+                cortex_m::asm::delay(12);
+                control.write(|w| {
+                    w.set_pid(0, pid);
+                    w.set_length(0, self.info.max_packet_size);
+                    w.set_available(0, true);
+                });
+                trace!("READ OK, rx_len = {}", rx_len);
+                Poll::Ready(Ok(rx_len))
+            })
         })
-        .await;
-
-        let rx_len = val.length(0) as usize;
-        if rx_len > buf.len() {
-            return Err(EndpointError::BufferOverflow);
-        }
-        self.buf.read(&mut buf[..rx_len]);
-
-        trace!("READ OK, rx_len = {}", rx_len);
-
-        let pid = !val.pid(0);
-        T::dpram().ep_out_buffer_control(index).write(|w| {
-            w.set_pid(0, pid);
-            w.set_length(0, self.info.max_packet_size);
-        });
-        cortex_m::asm::delay(12);
-        T::dpram().ep_out_buffer_control(index).write(|w| {
-            w.set_pid(0, pid);
-            w.set_length(0, self.info.max_packet_size);
-            w.set_available(0, true);
-        });
-
-        Ok(rx_len)
+        .await
     }
 }
 
